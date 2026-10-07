@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yomiagen パイプライン全体構造</title>
+<link rel="stylesheet" href="assets/doc.css">
+<script>
+  window.DOC_CONFIG = {
+    highlight:   { enable: false },
+    themeToggle: { enable: true }
+  };
+</script>
+</head>
+
+<body>
+<a class="doc-skip-link" href="#main">本文へスキップ</a>
+<div class="doc-layout">
+  <aside class="doc-toc" id="doc-toc"></aside>
+
+  <div class="doc-main" id="main">
+    <header class="doc-header">
+      <p class="doc-eyebrow">アーキテクチャガイド / Architecture Guide</p>
+      <h1>Yomiagen パイプライン全体構造</h1>
+      <p class="doc-subtitle">文書の取り込みから読み上げ用音声の完成までを、6 つのステージと編集可能な中間ファイルでつなぐ仕組みを説明する。</p>
+      <dl class="doc-meta">
+        <div><dt>作成日</dt><dd>2026-09-21</dd></div>
+        <div><dt>最終更新</dt><dd>2026-09-21</dd></div>
+        <div><dt>バージョン</dt><dd>1.0</dd></div>
+        <div><dt>対象読者</dt><dd>利用者 / 開発者 / 将来の保守担当者</dd></div>
+        <div><dt>対象実装</dt><dd>VOICEVOX バックエンド</dd></div>
+        <div><dt>ステータス</dt><dd><span class="badge badge-success">実装済み</span></dd></div>
+      </dl>
+    </header>
+
+    <article class="doc-body">
+      <p class="lead">Yomiagen は、HTML・Markdown・テキストを「耳で理解しやすい台本」に変換し、VOICEVOX で音声化するコマンドラインツールである。処理を一枚岩にせず 6 ステージに分け、各結果をジョブディレクトリへ保存することで、自動実行と人手によるレビューを同じ仕組みで両立している。</p>
+
+      <div class="callout callout-info" data-title="この文書で分かること">
+        <p>どのステージが何を受け取り、何を作るのか。読みやアクセントをどこで直すのか。変更後にどこから再実行すればよいのか。外部サービスの失敗時に何が起きるのかを、実装コードを読まずに把握できる。</p>
+      </div>
+
+      <h2>まず押さえる3つの考え方</h2>
+
+      <div class="doc-grid">
+        <div class="card">
+          <span class="stat"><span class="stat-value">6</span><span class="stat-label">独立した処理ステージ</span></span>
+          <p>取り込み・台本化・発話化・クエリ生成・合成・組み立てに分離する。</p>
+        </div>
+        <div class="card">
+          <span class="stat"><span class="stat-value">File</span><span class="stat-label">中間状態の保存単位</span></span>
+          <p>専用UIではなく、読み書きできる JSON と WAV をレビュー面として使う。</p>
+        </div>
+        <div class="card">
+          <span class="stat"><span class="stat-value">Hash</span><span class="stat-label">再実行の判定方法</span></span>
+          <p>入力内容のハッシュで変更を検出し、変更のない処理と音声合成を省略する。</p>
+        </div>
+      </div>
+
+      <h3>1. ステージを順番につなぐ</h3>
+      <p>パイプラインは <code>ingest → script → pronounce → query → synthesize → assemble</code> の順で進む。<code>run</code> コマンドは全ステージを連続実行し、個別コマンドは指定したステージだけを実行する。</p>
+
+      <h3>2. 中間生成物を人が直せる</h3>
+      <p>各ステージは次のステージへメモリ上の値を直接渡さず、ジョブディレクトリ内のファイルへ書き出す。利用者は <code>30_speech.json</code> で発話単位や調整命令を直すことも、<code>35_query/*.json</code> で VOICEVOX の AudioQuery を直接直すこともできる。</p>
+
+      <h3>3. 変更された部分だけをやり直す</h3>
+      <p>ステージ入力と設定からハッシュを計算し、前回と同じなら処理を省略する。音声合成はチャンクごとにクエリ内容を記録するため、AudioQuery を 1 ファイルだけ編集すると、そのチャンクだけを再合成できる。</p>
+
+      <h2>全体フロー</h2>
+
+      <div class="mermaid">
+flowchart LR
+  Input["入力&lt;br/&gt;URL / HTML / Markdown / Text"] --> Ingest["1. ingest&lt;br/&gt;文書構造を抽出"]
+  Ingest --> D["10_document.json"]
+  D --> Script["2. script&lt;br/&gt;耳で聞ける台本へ変換"]
+  OpenAI["OpenAI&lt;br/&gt;任意"] -.-> Script
+  Script --> S["20_script.json"]
+  S --> Pronounce["3. pronounce&lt;br/&gt;発話分割・間・読み"]
+  Pronounce --> SP["30_speech.json"]
+  SP --> Query["4. query&lt;br/&gt;AudioQuery・抑揚調整"]
+  Voicevox["VOICEVOX ENGINE"] &lt;--> Query
+  Query --> Q["35_query/*.json"]
+  Q --> Synth["5. synthesize&lt;br/&gt;チャンク音声を生成"]
+  Voicevox &lt;--> Synth
+  Synth --> W["40_chunks/*.wav"]
+  W --> Assemble["6. assemble&lt;br/&gt;結合・章・圧縮"]
+  FFmpeg["ffmpeg"] -.-> Assemble
+  Assemble --> Output["50_output.wav / .m4a"]
+      </div>
+
+      <p>実線はデータの流れ、点線は外部機能の利用を表す。OpenAI は台本品質を上げるための任意依存であり、APIキーがない場合は原文構造を保つローカル変換で処理を継続する。VOICEVOX は現在の音声合成に必要な依存である。</p>
+
+      <h2>ステージと成果物の対応</h2>
+
+      <div class="doc-wide">
+        <table>
+          <caption>表 1: パイプラインの6ステージ</caption>
+          <thead>
+            <tr>
+              <th scope="col">ステージ</th>
+              <th scope="col">主な入力</th>
+              <th scope="col">主な処理</th>
+              <th scope="col">出力</th>
+              <th scope="col">人が編集する場面</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">ingest</th><td>URLまたはローカル文書</td><td>本文抽出、ブロック化、言語判定</td><td><code>10_document.json</code></td><td>抽出漏れや不要部分を直す</td></tr>
+            <tr><th scope="row">script</th><td><code>10_document.json</code></td><td>読み上げ台本化、用語辞書生成</td><td><code>20_script.json</code></td><td>言い回しや読み上げ対象を直す</td></tr>
+            <tr><th scope="row">pronounce</th><td><code>20_script.json</code></td><td>発話分割、間と見出しルールの付与</td><td><code>30_speech.json</code></td><td>読み仮名や抑揚操作を追加する</td></tr>
+            <tr><th scope="row">query</th><td><code>30_speech.json</code></td><td>AudioQuery生成、エンジン固有調整</td><td><code>35_query/*.json</code></td><td>アクセント・ピッチ・音長を直接調整する</td></tr>
+            <tr><th scope="row">synthesize</th><td><code>35_query/*.json</code></td><td>VOICEVOXでチャンク単位に合成</td><td><code>40_chunks/*.wav</code></td><td>試聴して前段へ戻る</td></tr>
+            <tr><th scope="row">assemble</th><td><code>40_chunks/*.wav</code></td><td>WAV結合、章作成、M4A/MP3変換</td><td><code>50_output.*</code></td><td>通常は編集しない</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>各ステージの役割</h2>
+
+      <h3>1. ingest — 入力を論理文書にする</h3>
+      <p>URLならHTTPで取得し、ローカルファイルならそのまま読む。HTMLでは <code>article</code>、<code>main</code>、<code>body</code> の優先順で本文領域を探し、見出し・段落・リスト・引用・コード・表・キャプションへ分ける。ナビゲーション、サイドバー、スクリプトなどは除外する。</p>
+      <dl>
+        <dt>重要な設計判断</dt><dd>「きれいなプレーンテキスト」へ潰さず、見出しレベルやコードなど、後段の読み替えに必要な構造を残す。</dd>
+        <dt>キャッシュ入力</dt><dd>取得した原文の内容と入力種別。</dd>
+        <dt>実装</dt><dd><a href="../internal/ingest/ingest.go"><code>internal/ingest</code></a></dd>
+      </dl>
+
+      <h3>2. script — 目で読む文書を耳で聞く台本にする</h3>
+      <p>OpenAI Responses APIが利用できる場合は、表・コード・視覚参照を音声向けの文章へ変換する。これは要約ではなく媒体変換であり、元の情報をできるだけ保つ。数字や記号を含む技術用語はVOICEVOXが誤読しやすいため、読みやすい形へ展開し、繰り返し使う特殊な読みは辞書候補として出力する。</p>
+      <div class="callout callout-note" data-title="OpenAI APIキーがない場合">
+        <p>処理を停止せず、Documentの各ブロックをそのままUtteranceへ移す。音声向けの言い換え品質は下がるが、ローカル環境だけで最後まで実行できる。</p>
+      </div>
+      <dl>
+        <dt>大きな文書</dt><dd>ブロック境界を保ったまま、およそ 4,000 文字ごとに分割して送る。</dd>
+        <dt>文脈の連続性</dt><dd>次のリクエストへ直前出力の末尾 200 文字を渡す。</dd>
+        <dt>実装</dt><dd><a href="../internal/script/script.go"><code>internal/script</code></a></dd>
+      </dl>
+
+      <h3>3. pronounce — 台本を合成単位へ分ける</h3>
+      <p>台本の発話を文境界で分割し、既定では最大 200 文字のチャンクへ詰める。長すぎる文は読点、それでも長ければ文字数で切る。見出しには遅めの話速と前後の間、通常段落には段落末の間、疑問文には疑問上昇調を付ける。</p>
+      <p>ここで付ける調整は音声データではなく、<code>global</code> や <code>interrogative</code> といった操作データである。利用者は <code>30_speech.json</code> の <code>ops</code> を編集して調整を追加できる。</p>
+
+      <h3>4. query — エンジン固有の表現力を適用する</h3>
+      <p>各チャンクをVOICEVOXへ送り、ネイティブなAudioQueryを生成する。処理前に <code>/engine_manifest</code> を読み、エンジンが申告した機能だけを使う。未対応操作は既定では警告して省略し、厳格モードではエラーにできる。</p>
+
+      <table>
+        <caption>表 2: VOICEVOX向けに実装済みの調整操作</caption>
+        <thead><tr><th scope="col">操作</th><th scope="col">効果</th><th scope="col">主な用途</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>accent</code></th><td>アクセント核を変更し、モーラ情報を再計算</td><td>固有名詞のアクセント修正</td></tr>
+          <tr><th scope="row"><code>emphasize</code></th><td>対象モーラのピッチを加算</td><td>語の強調</td></tr>
+          <tr><th scope="row"><code>lengthen</code></th><td>母音・子音の長さを倍率変更</td><td>タメやゆっくりした発音</td></tr>
+          <tr><th scope="row"><code>devoice</code></th><td>母音を無声化</td><td>自然な日本語発音</td></tr>
+          <tr><th scope="row"><code>pause</code></th><td>アクセント句末の無音時間を設定</td><td>理解しやすい間</td></tr>
+          <tr><th scope="row"><code>interrogative</code></th><td>疑問上昇調を有効化</td><td>疑問文</td></tr>
+          <tr><th scope="row"><code>global</code></th><td>話速・音高・抑揚・音量・前後無音を設定</td><td>文書全体や見出しの調子</td></tr>
+          <tr><th scope="row"><code>patch</code></th><td>ネイティブJSONへ直接マージ</td><td>名前付き操作にない実験的調整</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout callout-info" data-title="操作の適用順">
+        <p>アクセントのようにエンジン再計算が必要な操作を先に適用し、<code>/mora_data</code> を 1 回だけ呼ぶ。その後にピッチ・音長・無声化・パッチを適用する。これにより、直接調整した値が再計算で消えることを防ぐ。</p>
+      </div>
+
+      <h3>5. synthesize — チャンクごとに音声化する</h3>
+      <p><code>35_query</code> の各ファイルをVOICEVOXへ送り、対応するWAVを <code>40_chunks</code> に保存する。既定の並列度は 1 である。VOICEVOX ENGINEは内部で合成を直列化するため、同時リクエストを増やしても実測上の短縮効果がなかったためである。</p>
+      <ul>
+        <li>クエリ内容のハッシュが同じでWAVが存在する場合は合成を省略する。</li>
+        <li><code>--only c0003,c0007</code> で対象チャンクを限定できる。</li>
+        <li>失敗時は最大 3 回、待ち時間を増やしながら再試行する。</li>
+        <li>すべて失敗したチャンクは 1 秒の無音に置き換え、ジョブ全体は継続する。</li>
+        <li>文字数、音声秒数、処理時間、料金を <code>cost.jsonl</code> へ追記する。</li>
+      </ul>
+
+      <h3>6. assemble — 1本の音声ファイルへまとめる</h3>
+      <p>チャンク順にWAVの <code>fmt</code> と <code>data</code> を読み、形式が同じことを確認してサンプル単位で連結する。同時に、見出しチャンクの開始位置からチャプター時刻を計算する。</p>
+      <p>常に <code>50_output.wav</code> を作り、ffmpegが利用できればラウドネス正規化とチャプター埋め込みを行ってM4AまたはMP3へ変換する。ffmpegが使えない場合は警告を出し、WAVを最終成果物として残す。</p>
+
+      <h2>ジョブディレクトリ</h2>
+
+      <p>1回の変換処理を「ジョブ」と呼ぶ。既定の保存場所は <code>~/.local/share/yomiagen/jobs/&lt;job-id&gt;</code> で、<code>YOMIAGEN_HOME</code> により変更できる。</p>
+
+      <figure class="code-block" data-filename="$YOMIAGEN_HOME/jobs/20260921-143052-article/">
+<pre><code>job.json                  # ジョブ情報、ステージ状態、入力ハッシュ
+cost.jsonl                # コストと処理時間の追記ログ
+00_source.html            # 取得した原文（md / txt の場合もある）
+10_document.json          # 構造化した論理文書
+20_script.json            # 読み上げ台本と用語辞書
+30_speech.json            # 発話チャンクと抑揚操作
+35_query/
+  c0001.json              # VOICEVOX AudioQuery
+  c0002.json
+40_chunks/
+  c0001.wav               # チャンクごとの合成音声
+  c0002.wav
+50_output.wav             # 結合済みPCM音声
+50_chapters.txt           # ffmpeg用チャプターメタデータ
+50_output.m4a             # 配布・再生用の圧縮音声</code></pre>
+        <figcaption>番号は処理順を示す。中間ファイルは後続ステージの入力でもあり、人がレビューする面でもある。</figcaption>
+      </figure>
+
+      <h2>レビューと部分再実行</h2>
+
+      <h3>最初から最後まで自動実行する</h3>
+      <pre><code class="language-shell">yomiagen run article.html</code></pre>
+
+      <h3>違和感のあるチャンクだけ調整する</h3>
+      <ol>
+        <li><code>30_speech.json</code> で元の発話とチャンクIDを確認する。</li>
+        <li><code>35_query/c0042.json</code> のアクセントやピッチを編集する。</li>
+        <li><code>c0042</code> だけを再合成して試聴する。</li>
+        <li>問題がなければ全チャンクを再結合する。</li>
+      </ol>
+
+      <pre><code class="language-shell">yomiagen show JOB_ID speech
+$EDITOR "$(yomiagen path JOB_ID query)/c0042.json"
+yomiagen synthesize JOB_ID --only c0042
+yomiagen assemble JOB_ID</code></pre>
+
+      <h3>特定ステージから再開する</h3>
+      <pre><code class="language-shell"># 台本を手編集した後、発話分割から最後まで実行する
+yomiagen run JOB_ID --from pronounce
+
+# キャッシュを無視してクエリ生成からやり直す
+yomiagen run JOB_ID --from query --force</code></pre>
+
+      <div class="callout callout-warn" data-title="編集するファイルに注意">
+        <p><code>--force</code> は対象ステージの既存出力を上書きする。手編集した <code>35_query/*.json</code> を残したい場合は、<code>query --force</code> を実行せず、<code>synthesize</code> から再開する。</p>
+      </div>
+
+      <h2>キャッシュと変更検知</h2>
+
+      <div class="mermaid">
+flowchart TD
+  Start["ステージ開始"] --> Hash["入力ファイルと設定からハッシュ計算"]
+  Hash --> Same{"前回と同じ?&lt;br/&gt;出力も存在する?"}
+  Same -->|Yes| Skip["ステージを省略"]
+  Same -->|No| Run["処理を実行"]
+  Run --> Save["出力と新しいハッシュを保存"]
+  Skip --> Next["次のステージへ"]
+  Save --> Next
+      </div>
+
+      <p>ステージ単位のハッシュは <code>job.json</code> に保存する。合成だけはさらに細かく、チャンクIDごとのクエリハッシュを保存する。この二段構えにより、高価または時間のかかる処理を避けながら、手編集の変更を見逃さない。</p>
+
+      <table>
+        <caption>表 3: 変更箇所と推奨再開位置</caption>
+        <thead><tr><th scope="col">変更したもの</th><th scope="col">再開位置</th><th scope="col">再利用されるもの</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">原文</th><td><code>ingest</code></td><td>原則なし</td></tr>
+          <tr><th scope="row"><code>10_document.json</code></th><td><code>script</code></td><td>原文取得</td></tr>
+          <tr><th scope="row"><code>20_script.json</code></th><td><code>pronounce</code></td><td>取り込み・台本API呼び出し</td></tr>
+          <tr><th scope="row"><code>30_speech.json</code></th><td><code>query</code></td><td>台本化まで</td></tr>
+          <tr><th scope="row"><code>35_query/c0042.json</code></th><td><code>synthesize --only c0042</code></td><td>他の全チャンク音声</td></tr>
+          <tr><th scope="row">チャプターや出力設定</th><td><code>assemble</code></td><td>全チャンク音声</td></tr>
+        </tbody>
+      </table>
+
+      <h2>TTS層の構造</h2>
+
+      <p>Yomiagenは、すべての音声エンジンを最小公約数へ押し込めない。共通操作とエンジン固有の表現を3層に分け、VOICEVOXの細かな調整能力を失わずに将来のバックエンド追加余地を残している。</p>
+
+      <dl>
+        <dt>L1 Backend — 最小の共通契約</dt><dd>テキスト、声、話速、音量を受け取りWAVを返す。単純な音声合成バックエンドでも実装できる。</dd>
+        <dt>L2 QueryBackend — ネイティブ中間表現</dt><dd>テキストからAudioQueryのような編集可能表現を作り、その表現から合成する。未知のフィールドを失わないよう、ネイティブJSONをそのまま保持する。</dd>
+        <dt>L3 Refiner — 名前付き調整操作</dt><dd><code>accent</code>、<code>pause</code> などをネイティブ表現へ適用する。機能対応はエンジンのcapability申告で判断する。</dd>
+      </dl>
+
+      <p>型とインターフェースは <a href="../internal/tts/tts.go"><code>internal/tts/tts.go</code></a>、VOICEVOX固有処理は <a href="../internal/tts/voicevox/refine.go"><code>internal/tts/voicevox/refine.go</code></a> に置かれている。</p>
+
+      <h2>失敗時の挙動</h2>
+
+      <table>
+        <caption>表 4: 外部依存や処理失敗への対応</caption>
+        <thead><tr><th scope="col">状況</th><th scope="col">挙動</th><th scope="col">ジョブ</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">OpenAI APIキーなし</th><td>原文ブロックを台本として通す</td><td><span class="badge badge-success">継続</span></td></tr>
+          <tr><th scope="row">OpenAIが安全性理由で拒否</th><td>該当部分だけ原文へフォールバック</td><td><span class="badge badge-success">継続</span></td></tr>
+          <tr><th scope="row">未対応の抑揚操作</th><td>既定では警告して省略。厳格モードではエラー</td><td><span class="badge badge-success">既定は継続</span></td></tr>
+          <tr><th scope="row">VOICEVOX合成失敗</th><td>指数バックオフで3回試行後、1秒の無音を生成</td><td><span class="badge badge-warn">欠落を記録して継続</span></td></tr>
+          <tr><th scope="row">WAV形式不一致</th><td>安全に結合できないためエラー</td><td><span class="badge badge-danger">停止</span></td></tr>
+          <tr><th scope="row">ffmpegなし・変換失敗</th><td>圧縮を諦め、結合済みWAVを残す</td><td><span class="badge badge-success">継続</span></td></tr>
+        </tbody>
+      </table>
+
+      <h2>運用コマンド</h2>
+
+      <dl>
+        <dt><code>jobs</code></dt><dd>ジョブ一覧と完了済みステージを確認する。</dd>
+        <dt><code>show JOB_ID speech</code></dt><dd>中間JSONを標準出力へ表示する。</dd>
+        <dt><code>path JOB_ID query</code></dt><dd>編集対象の実ファイルパスを得る。</dd>
+        <dt><code>cost JOB_ID</code></dt><dd>チャンクごとの文字数、音声秒数、処理時間、料金を確認する。</dd>
+        <dt><code>voices</code></dt><dd>VOICEVOXの話者とスタイルIDを一覧表示する。</dd>
+        <dt><code>say "テキスト"</code></dt><dd>プリセットの声を短文で試聴する。</dd>
+        <dt><code>caps</code></dt><dd>エンジンが申告する利用可能機能を表示する。</dd>
+      </dl>
+
+      <h2>実装の配置</h2>
+
+      <div class="doc-wide">
+        <table>
+          <caption>表 5: 主なパッケージと責務</caption>
+          <thead><tr><th scope="col">場所</th><th scope="col">責務</th><th scope="col">変更する場面</th></tr></thead>
+          <tbody>
+            <tr><th scope="row"><a href="../cmd/yomiagen/main.go"><code>cmd/yomiagen</code></a></th><td>CLI解析とステージの起動</td><td>コマンドやフラグを追加する</td></tr>
+            <tr><th scope="row"><a href="../internal/config/config.go"><code>internal/config</code></a></th><td>設定、プリセット、プロソディ</td><td>既定値や設定項目を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/job/job.go"><code>internal/job</code></a></th><td>ジョブ作成、状態、ハッシュ</td><td>キャッシュ規則を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/model/model.go"><code>internal/model</code></a></th><td>Document、Script、Speech</td><td>中間ファイルの形式を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/ingest/ingest.go"><code>internal/ingest</code></a></th><td>入力取得と文書抽出</td><td>入力形式や抽出規則を追加する</td></tr>
+            <tr><th scope="row"><a href="../internal/script/script.go"><code>internal/script</code></a></th><td>OpenAI台本変換</td><td>プロンプトや構造化出力を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/pronounce/pronounce.go"><code>internal/pronounce</code></a></th><td>文分割とルールベース調整</td><td>間や見出し規則を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/tts/voicevox/client.go"><code>internal/tts/voicevox</code></a></th><td>VOICEVOX APIと調整操作</td><td>音声エンジン機能を拡張する</td></tr>
+            <tr><th scope="row"><a href="../internal/pipeline/pipeline.go"><code>internal/pipeline</code></a></th><td>query以降のオーケストレーション</td><td>実行順、再試行、部分実行を変える</td></tr>
+            <tr><th scope="row"><a href="../internal/audio/assemble.go"><code>internal/audio</code></a></th><td>WAV解析・結合・ffmpeg実行</td><td>出力形式や章の作り方を変える</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2>検証済みの実動作</h2>
+
+      <p>2026-09-21 に VOICEVOX ENGINE 0.25.2 を <code>localhost:50021</code> で起動し、READMEを入力とする一気通貫テストを実施した。</p>
+
+      <div class="doc-grid">
+        <div class="card"><span class="stat"><span class="stat-value">8</span><span class="stat-label">合成チャンク数</span></span></div>
+        <div class="card"><span class="stat"><span class="stat-value">111.7s</span><span class="stat-label">生成音声の長さ</span></span></div>
+        <div class="card"><span class="stat"><span class="stat-value">2</span><span class="stat-label">埋め込みチャプター数</span></span></div>
+        <div class="card"><span class="stat"><span class="stat-value">0.47s</span><span class="stat-label">キャッシュ再実行</span></span></div>
+      </div>
+
+      <ul class="checklist">
+        <li><input type="checkbox" checked disabled> capabilityと話者一覧の取得</li>
+        <li><input type="checkbox" checked disabled> 24 kHz・モノラル・PCM WAVの短文合成</li>
+        <li><input type="checkbox" checked disabled> 6ステージの一気通貫実行</li>
+        <li><input type="checkbox" checked disabled> M4Aへの変換とチャプター埋め込み</li>
+        <li><input type="checkbox" checked disabled> 全区間のデコード検査</li>
+        <li><input type="checkbox" checked disabled> キャッシュ後の出力が元ファイルと一致</li>
+      </ul>
+
+      <h2>現在の範囲と拡張点</h2>
+
+      <h3>現在使える範囲</h3>
+      <ul>
+        <li>日本語を中心とするHTML、Markdown、プレーンテキストの取り込み</li>
+        <li>OpenAI利用またはローカルフォールバックによる台本化</li>
+        <li>VOICEVOXのAudioQueryを使った細かな読み・抑揚調整</li>
+        <li>WAV、M4A、MP3の出力とチャプター付与</li>
+        <li>ファイル編集を中心としたCLIレビュー運用</li>
+      </ul>
+
+      <h3>まだ実装していない範囲</h3>
+      <ul>
+        <li>AivisSpeech固有挙動への対応と実機検証</li>
+        <li>Google Cloud Text-to-Speechバックエンド</li>
+        <li>文書内の言語に応じたチャンク単位のバックエンド切り替え</li>
+        <li>ブラウザ上で中間生成物を編集・試聴するWeb UI</li>
+      </ul>
+
+      <div class="callout callout-success" data-title="拡張時に守る境界">
+        <p>新しい音声エンジンを追加するときも、エンジン固有表現を <code>Query.Doc</code> に保持し、対応機能を実行時に問い合わせる。共通インターフェースへ合わせるために、そのエンジン固有の表現力を削らない。</p>
+      </div>
+
+      <h2>関連資料</h2>
+      <ul>
+        <li><a href="2026-09-21_initial.md">初期デザインとコンセプト</a></li>
+        <li><a href="2026-09-21_implementation-plan.md">実装プラン</a></li>
+        <li><a href="2026-09-21_tech-research.md">VOICEVOXを中心とする技術調査</a></li>
+        <li><a href="../README.md">セットアップと基本的な使い方</a></li>
+      </ul>
+    </article>
+
+    <footer class="doc-footer">
+      <p>Yomiagen パイプライン全体構造 — v1.0</p>
+      <p>最終更新: 2026-09-21</p>
+    </footer>
+  </div>
+</div>
+<script src="assets/doc.js" defer></script>
+</body>
+</html>

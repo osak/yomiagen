@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "utterances": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "source_block": {"type": "string"},
+          "role": {"type": "string", "enum": ["heading", "body", "note"]},
+          "level": {"type": "integer"},
+          "text": {"type": "string"}
+        },
+        "required": ["source_block", "role", "level", "text"],
+        "additionalProperties": false
+      }
+    },
+    "lexicon": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "surface": {"type": "string"},
+          "pronunciation": {"type": "string"},
+          "accent_type": {"type": "integer"},
+          "word_type": {"type": "string", "enum": ["PROPER_NOUN", "COMMON_NOUN", "VERB", "ADJECTIVE", "SUFFIX"]},
+          "note": {"type": "string"}
+        },
+        "required": ["surface", "pronunciation", "accent_type", "word_type", "note"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["utterances", "lexicon"],
+  "additionalProperties": false
+}
