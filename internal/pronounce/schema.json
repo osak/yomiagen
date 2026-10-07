@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "chunks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "kana": {"type": "string"}
+        },
+        "required": ["id", "kana"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["chunks"],
+  "additionalProperties": false
+}
